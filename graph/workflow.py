@@ -7,6 +7,10 @@ from langchain_groq import ChatGroq
 from langchain_core.messages import SystemMessage, HumanMessage
 
 
+# --------------------------------------------------
+# 1. LANGGRAPH STATE
+# --------------------------------------------------
+
 class ResumeState(TypedDict, total=False):
     resume_text: str
     job_description: str
@@ -14,6 +18,10 @@ class ResumeState(TypedDict, total=False):
     api_key: str
     analysis: dict
 
+
+# --------------------------------------------------
+# 2. SYSTEM PROMPT
+# --------------------------------------------------
 
 SYSTEM_PROMPT = """
 You are a careful resume-to-job-description analyst.
@@ -27,7 +35,7 @@ This does not prove the candidate lacks the skill.
 
 Extract distinct and meaningful requirements from the job description.
 
-Classify priority:
+Priority:
 - required: mandatory or core requirements
 - preferred: optional, nice-to-have, bonus, or less central requirements
 
@@ -42,7 +50,7 @@ If there is no evidence, return an empty string.
 
 Do not calculate any score. Python calculates the score.
 
-Return ONLY valid JSON using this schema:
+Return ONLY one valid JSON object using this schema:
 
 {
   "requirements": [
@@ -63,44 +71,88 @@ Return ONLY valid JSON using this schema:
   "detailed_analysis": "explain the main strengths and gaps"
 }
 
-Return 5-25 distinct requirements when the job description supports that
-many meaningful requirements. Do not return match_score or any other score.
+Return 5-25 distinct requirements when the job description supports
+that many meaningful requirements.
+
+Do not return match_score or any other score.
+Use double quotes for all JSON keys and string values.
+Do not include Markdown fences or text outside the JSON object.
 """
 
 
+# --------------------------------------------------
+# 3. JSON PARSER
+# --------------------------------------------------
+
 def parse_json(content: str) -> dict:
-    """Parse JSON returned by the LLM."""
+    """Parse a JSON object from the model response."""
+
+    if not isinstance(content, str):
+        raise ValueError("The model response was not text.")
+
     content = content.strip()
 
+    if not content:
+        raise ValueError("The model returned an empty response.")
+
+    # Remove Markdown code fences if present.
     if content.startswith("```"):
-        content = content.split("\n", 1)[1]
+        lines = content.splitlines()
 
-        if content.rstrip().endswith("```"):
-            content = content.rstrip()[:-3]
+        if lines and lines[0].strip().startswith("```"):
+            lines = lines[1:]
 
+        if lines and lines[-1].strip() == "```":
+            lines = lines[:-1]
+
+        content = "\n".join(lines).strip()
+
+    # First try parsing the complete response.
+    try:
+        result = json.loads(content)
+
+        if isinstance(result, dict):
+            return result
+
+    except json.JSONDecodeError:
+        pass
+
+    # Next try finding a JSON object surrounded by extra text.
     start = content.find("{")
-    end = content.rfind("}")
 
-    if start < 0 or end < start:
-        raise ValueError(
-            "The model did not return valid JSON. Please retry."
-        )
+    if start == -1:
+        raise ValueError("The model returned no JSON object.")
+
+    decoder = json.JSONDecoder()
 
     try:
-        return json.loads(content[start:end + 1])
+        result, _ = decoder.raw_decode(content[start:])
+
+        if isinstance(result, dict):
+            return result
+
     except json.JSONDecodeError as exc:
         raise ValueError(
-            "The model returned malformed JSON. Please retry."
+            "The model returned incomplete or malformed JSON. "
+            "The response may have been cut off."
         ) from exc
 
+    raise ValueError("The model did not return a JSON object.")
+
+
+# --------------------------------------------------
+# 4. NORMALIZE REQUIREMENTS
+# --------------------------------------------------
 
 def normalize_requirements(data: dict) -> list:
-    """Validate and normalize the requirements returned by the LLM."""
+    """Validate and normalize requirements returned by the LLM."""
+
     raw = data.get("requirements", [])
 
     if not isinstance(raw, list) or not raw:
         raise ValueError(
-            "No requirements were returned. Paste a more complete job description."
+            "No requirements were returned. "
+            "Please provide a more complete job description."
         )
 
     output = []
@@ -148,16 +200,18 @@ def normalize_requirements(data: dict) -> list:
 
     if not output:
         raise ValueError(
-            "No usable requirements were returned by the model."
+            "The model did not return any usable requirements."
         )
 
     return output
 
 
+# --------------------------------------------------
+# 5. CALCULATE SCORES IN PYTHON
+# --------------------------------------------------
+
 def calculate_scores(requirements: list) -> dict:
     """
-    Calculate a reproducible weighted resume-match score.
-
     Required requirement weight = 2
     Preferred requirement weight = 1
 
@@ -181,8 +235,6 @@ def calculate_scores(requirements: list) -> dict:
     }
 
     for item in requirements:
-
-        # Required skills count twice as much.
         weight = (
             2.0
             if item["priority"] == "required"
@@ -205,12 +257,12 @@ def calculate_scores(requirements: list) -> dict:
         category_totals[item["priority"]][1] += weight
 
     def percentage(values):
-        points, weight = values
+        points, possible = values
 
-        if weight == 0:
+        if possible == 0:
             return None
 
-        return round(100 * points / weight)
+        return round(100 * points / possible)
 
     overall_score = (
         round(100 * total_points / total_weight)
@@ -220,15 +272,12 @@ def calculate_scores(requirements: list) -> dict:
 
     return {
         "match_score": overall_score,
-
         "required_score": percentage(
             category_totals["required"]
         ),
-
         "preferred_score": percentage(
             category_totals["preferred"]
         ),
-
         "score_method": {
             "required_weight": 2,
             "preferred_weight": 1,
@@ -239,35 +288,46 @@ def calculate_scores(requirements: list) -> dict:
     }
 
 
+# --------------------------------------------------
+# 6. LANGGRAPH NODE
+# --------------------------------------------------
+
 def analyze_node(state: ResumeState) -> ResumeState:
-    """Use Groq to analyze the resume and job requirements."""
+    """Analyze the resume against the job description."""
 
     llm = ChatGroq(
         groq_api_key=state["api_key"],
         model=state["model_name"],
-        temperature=0.1,
+        temperature=0,
         max_retries=2,
     )
 
-    prompt = f"""
-Analyze the resume against the job description.
+    # Limit input size to avoid unnecessarily large requests.
+    resume_text = state["resume_text"][:20000]
+    job_description = state["job_description"][:10000]
 
-Return the JSON schema specified in the system instructions.
-Do not calculate a score.
+    prompt = f"""
+Analyze this resume against the job description.
+
+Follow the system instructions and return the specified JSON object.
+Do not calculate any scores.
 
 <RESUME>
-{state['resume_text'][:24000]}
+{resume_text}
 </RESUME>
 
 <JOB_DESCRIPTION>
-{state['job_description'][:14000]}
+{job_description}
 </JOB_DESCRIPTION>
 """
 
-    response = llm.invoke([
+    messages = [
         SystemMessage(content=SYSTEM_PROMPT),
         HumanMessage(content=prompt),
-    ])
+    ]
+
+    # First attempt.
+    response = llm.invoke(messages)
 
     content = (
         response.content
@@ -275,12 +335,48 @@ Do not calculate a score.
         else str(response.content)
     )
 
-    data = parse_json(content)
+    # Parse the first response. If malformed, retry once.
+    try:
+        data = parse_json(content)
 
+    except ValueError:
+        repair_prompt = f"""
+The previous model response was not valid JSON.
+
+Return a corrected JSON object using the exact schema in the
+system instructions.
+
+Requirements:
+- Return JSON only.
+- Use double quotes for JSON keys and string values.
+- Close all strings, arrays, and objects.
+- Preserve the available information.
+- Do not invent resume evidence or qualifications.
+- Do not include Markdown fences or explanations.
+- Keep the response concise enough to complete.
+
+Malformed response:
+{content[:12000]}
+"""
+
+        repaired_response = llm.invoke([
+            SystemMessage(content=SYSTEM_PROMPT),
+            HumanMessage(content=repair_prompt),
+        ])
+
+        repaired_content = (
+            repaired_response.content
+            if isinstance(repaired_response.content, str)
+            else str(repaired_response.content)
+        )
+
+        # If this also fails, the error is passed to Streamlit.
+        data = parse_json(repaired_content)
+
+    # Validate requirements.
     requirements = normalize_requirements(data)
 
-    # IMPORTANT:
-    # Python calculates the score, not the LLM.
+    # Scores are calculated by Python, not by the LLM.
     scores = calculate_scores(requirements)
 
     analysis = {
@@ -326,26 +422,35 @@ Do not calculate a score.
     return {"analysis": analysis}
 
 
+# --------------------------------------------------
+# 7. BUILD LANGGRAPH WORKFLOW
+# --------------------------------------------------
+
 def build_graph():
     graph = StateGraph(ResumeState)
 
     graph.add_node(
         "analyze_and_score",
-        analyze_node
+        analyze_node,
     )
 
     graph.set_entry_point("analyze_and_score")
 
     graph.add_edge(
         "analyze_and_score",
-        END
+        END,
     )
 
     return graph.compile()
 
 
+# Compile the workflow once.
 _workflow = build_graph()
 
+
+# --------------------------------------------------
+# 8. PUBLIC FUNCTION CALLED BY STREAMLIT
+# --------------------------------------------------
 
 def analyze_resume(
     resume_text: str,
@@ -353,6 +458,22 @@ def analyze_resume(
     api_key: str,
     model_name: str,
 ) -> dict:
+    """Run the workflow and return the analysis."""
+
+    if not resume_text.strip():
+        raise ValueError(
+            "No readable text was found in the resume PDF."
+        )
+
+    if not job_description.strip():
+        raise ValueError(
+            "Please enter a job description."
+        )
+
+    if not api_key:
+        raise ValueError(
+            "Groq API key is missing. Configure GROQ_API_KEY."
+        )
 
     state = _workflow.invoke({
         "resume_text": resume_text,
