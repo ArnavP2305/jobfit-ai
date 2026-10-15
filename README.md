@@ -65,10 +65,17 @@ flowchart TD
 
 ### Formula
 
-For each extracted requirement $i$:
-$$\text{points\_awarded}_i = \text{priority\_weight}_i \times \text{evidence\_value}_i$$
+For each requirement $i$:
 
-$$\text{Overall Score} = \text{round}\left(100 \times \frac{\sum \text{points\_awarded}}{\sum \text{priority\_weights}}\right)$$
+$$\text{Points Awarded}_i = \text{Priority Weight}_i \times \text{Evidence Value}_i$$
+
+$$\text{Overall Score} = \text{round}\left(100 \times \frac{\sum \text{Points Awarded}_i}{\sum \text{Priority Weight}_i}\right)$$
+
+```python
+# Deterministic Python calculation
+points_awarded = priority_weight * evidence_value
+overall_score = round(100 * sum(points_awarded) / sum(priority_weights))
+```
 
 ### Priority Weights
 | Requirement Type | Weight | Description |
