@@ -249,7 +249,7 @@ with st.sidebar:
         [
             "openai/gpt-oss-120b",
             "qwen/qwen3.8-27b",
-            "llama-3.3-70b-versatile",
+            "openai/gpt-oss-20b",
         ],
         index=0,
     )
@@ -313,7 +313,10 @@ with right:
 
 if st.button("✦ Analyze my match", use_container_width=True):
 
-    api_key = os.getenv("GROQ_API_KEY", "").strip()
+    api_key = os.getenv("GROQ_API_KEY", "")
+    if not api_key and hasattr(st, "secrets") and "GROQ_API_KEY" in st.secrets:
+        api_key = st.secrets["GROQ_API_KEY"]
+    api_key = str(api_key).strip().strip("\"'")
 
     if not api_key:
         st.error("GROQ_API_KEY is missing. Add it to your .env file.")

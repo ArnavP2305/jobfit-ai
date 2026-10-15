@@ -85,7 +85,7 @@ Do not include Markdown fences or text outside the JSON object.
 # --------------------------------------------------
 
 def parse_json(content: str) -> dict:
-    """Parse a JSON object from the model response."""
+    """Parse a JSON object or list from the model response."""
 
     if not isinstance(content, str):
         raise ValueError("The model response was not text.")
@@ -96,48 +96,42 @@ def parse_json(content: str) -> dict:
         raise ValueError("The model returned an empty response.")
 
     # Remove Markdown code fences if present.
-    if content.startswith("```"):
+    if "```" in content:
         lines = content.splitlines()
+        cleaned = []
+        inside_fence = False
+        for line in lines:
+            if line.strip().startswith("```"):
+                inside_fence = not inside_fence
+                continue
+            cleaned.append(line)
+        content = "\n".join(cleaned).strip()
 
-        if lines and lines[0].strip().startswith("```"):
-            lines = lines[1:]
-
-        if lines and lines[-1].strip() == "```":
-            lines = lines[:-1]
-
-        content = "\n".join(lines).strip()
-
-    # First try parsing the complete response.
+    # First try parsing the complete response directly.
     try:
         result = json.loads(content)
-
+        if isinstance(result, list):
+            return {"requirements": result}
         if isinstance(result, dict):
             return result
-
     except json.JSONDecodeError:
         pass
 
-    # Next try finding a JSON object surrounded by extra text.
-    start = content.find("{")
+    # Next try finding a JSON object or array surrounded by extra text.
+    for start_char in ["{", "["]:
+        start = content.find(start_char)
+        if start != -1:
+            decoder = json.JSONDecoder()
+            try:
+                result, _ = decoder.raw_decode(content[start:])
+                if isinstance(result, list):
+                    return {"requirements": result}
+                if isinstance(result, dict):
+                    return result
+            except json.JSONDecodeError:
+                pass
 
-    if start == -1:
-        raise ValueError("The model returned no JSON object.")
-
-    decoder = json.JSONDecoder()
-
-    try:
-        result, _ = decoder.raw_decode(content[start:])
-
-        if isinstance(result, dict):
-            return result
-
-    except json.JSONDecodeError as exc:
-        raise ValueError(
-            "The model returned incomplete or malformed JSON. "
-            "The response may have been cut off."
-        ) from exc
-
-    raise ValueError("The model did not return a JSON object.")
+    raise ValueError("The model did not return a valid JSON object or array.")
 
 
 # --------------------------------------------------
@@ -147,7 +141,19 @@ def parse_json(content: str) -> dict:
 def normalize_requirements(data: dict) -> list:
     """Validate and normalize requirements returned by the LLM."""
 
-    raw = data.get("requirements", [])
+    if isinstance(data, list):
+        raw = data
+    elif isinstance(data, dict):
+        raw = (
+            data.get("requirements")
+            or data.get("Requirements")
+            or data.get("skills")
+            or data.get("Skills")
+            or data.get("job_requirements")
+            or []
+        )
+    else:
+        raw = []
 
     if not isinstance(raw, list) or not raw:
         raise ValueError(
@@ -162,7 +168,12 @@ def normalize_requirements(data: dict) -> list:
         if not isinstance(item, dict):
             continue
 
-        skill = str(item.get("skill", "")).strip()
+        skill = str(
+            item.get("skill")
+            or item.get("requirement")
+            or item.get("name")
+            or ""
+        ).strip()
 
         if not skill or skill.casefold() in seen:
             continue
@@ -177,7 +188,9 @@ def normalize_requirements(data: dict) -> list:
             priority = "preferred"
 
         status = str(
-            item.get("evidence_status", "not_found")
+            item.get("evidence_status")
+            or item.get("status")
+            or "not_found"
         ).lower().strip()
 
         if status not in ("supported", "partial", "not_found"):
@@ -299,6 +312,7 @@ def analyze_node(state: ResumeState) -> ResumeState:
         groq_api_key=state["api_key"],
         model=state["model_name"],
         temperature=0,
+        max_tokens=6000,
         max_retries=2,
     )
 
@@ -470,7 +484,9 @@ def analyze_resume(
             "Please enter a job description."
         )
 
-    if not api_key:
+    clean_api_key = api_key.strip().strip("\"'")
+
+    if not clean_api_key:
         raise ValueError(
             "Groq API key is missing. Configure GROQ_API_KEY."
         )
@@ -478,7 +494,7 @@ def analyze_resume(
     state = _workflow.invoke({
         "resume_text": resume_text,
         "job_description": job_description,
-        "api_key": api_key,
+        "api_key": clean_api_key,
         "model_name": model_name,
     })
 
